@@ -186,7 +186,7 @@ function bench(name, func, src) {
   count = lpad(count, COL2);
   duration = lpad(duration, COL3);
   score = lpad(score, COL4);
-  console.log(name, "|", count, "|", duration, "|", score, "|", src.length);
+  console.log(name, "|", count, "|", duration, "|", score);
   return ret;
 }
 
