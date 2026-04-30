@@ -1,5 +1,4 @@
-var msgpackr = require("../dist/node.cjs");
-console.log('isNativeAccelerationEnabled', msgpackr.isNativeAccelerationEnabled)
+import * as msgpackr from "../index.js";
 var msgpack_node = tryRequire("msgpack");
 var msgpack_msgpack = tryRequire("@msgpack/msgpack");
 var msgpack_lite = tryRequire("msgpack-lite");
@@ -12,22 +11,18 @@ var notepack = tryRequire("notepack");
 var what_the_pack = tryRequire("what-the-pack");
 var avro = tryRequire('avsc')
 var cbor = tryRequire('cbor')
-var inspector  = require('inspector');
-//inspector.open(9229, null, true); debugger
-const LAZY = { lazy: true };
 
-
-msgpack5 = msgpack5 && msgpack5();
+/*msgpack5 = msgpack5 && msgpack5();
 msgpack_codec = msgpack_codec && msgpack_codec.msgpack;
-what_the_pack = what_the_pack && what_the_pack.initialize(2**20);
+what_the_pack = what_the_pack && what_the_pack.initialize(2**20);*/
 
 var pkg = require("../package.json");
-var data = require("./example4.json");
-var packed = msgpack_lite && msgpack_lite.encode(data);
+var data = require("./example5.json");
+//var packed = msgpack_lite && msgpack_lite.encode(data);
 var expected = JSON.stringify(data);
 
 var argv = Array.prototype.slice.call(process.argv, 2);
-
+console.log('msgpackr: ',msgpackr)
 if (argv[0] === "-v") {
   console.warn(pkg.name + " " + pkg.version);
   process.exit(0);
@@ -42,27 +37,18 @@ var COL2 = 7;
 var COL3 = 5;
 var COL4 = 6;
 
-console.log(rpad("operation", COL1), "|", "  op  ", "|", "  ms ", "|", " op/s ", "|", "size");
-console.log(rpad("", COL1, "-"), "|", lpad(":", COL2, "-"), "|", lpad(":", COL3, "-"), "|", lpad(":", COL4, "-"), "|", lpad(":", COL4, "-"));
+console.log(rpad("operation", COL1), "|", "  op  ", "|", "  ms ", "|", " op/s ");
+console.log(rpad("", COL1, "-"), "|", lpad(":", COL2, "-"), "|", lpad(":", COL3, "-"), "|", lpad(":", COL4, "-"));
 
 var buf, obj;
 
 if (msgpackr) {
-  let packr, last
-  let keys = ['littleNum'];//Object.keys(data);
+  let packr
   packr = new msgpackr.Packr({ structures: [] })
   buf = bench('msgpackr w/ shared structures: packr.pack(obj);', packr.pack.bind(packr), data);
-  console.log('buffer size', buf.length);
   //buf = bench('msgpackr w/ shared structures: packr.pack(obj);', data => {let result = packr.pack(data); packr.resetMemory(); return result;}, data);
-  obj = bench('msgpackr w/ shared structures: packr.unpack(buf);', value => packr.unpack(value), buf);
-  test(obj);
 
-  packr = new msgpackr.Packr({ structures: [],randomAccessStructure: true, saveStructures(structures) {
-    } })
-  buf = bench('msgpackr w/ random access structures: packr.pack(obj);', value => packr.pack(value), data);
-  //buf = bench('msgpackr w/ shared structures: packr.pack(obj);', data => {let result = packr.pack(data); packr.resetMemory(); return result;}, data);
-  console.log('buffer size', buf.length);
-  obj = bench('msgpackr w/ random access structures: packr.unpack(buf);', value => packr.unpack(value), buf);
+  obj = bench('msgpackr w/ shared structures: packr.unpack(buf);', packr.unpack.bind(packr), buf);
   test(obj);
 
   packr = new msgpackr.Packr({ useRecords: false })
@@ -82,7 +68,6 @@ if (msgpackr) {
 }
 
 if (JSON) {
-console.log('JSON')
   buf = bench('buf = Buffer(JSON.stringify(obj));', JSON_stringify, data);
   obj = bench('obj = JSON.parse(buf);', JSON.parse, buf);
   test(obj);
@@ -158,11 +143,11 @@ if (cbor) {
 }
 
 function JSON_stringify(src) {
-  return Buffer.from(JSON.stringify(src));
+  return JSON.stringify(src);
 }
 
 function msgpack_codec_pack(data) {
-  return Buffer.from(msgpack_codec.pack(data));
+  return Buffer(msgpack_codec.pack(data));
 }
 
 function bench(name, func, src) {

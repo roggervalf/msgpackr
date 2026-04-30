@@ -1,5 +1,6 @@
-export { Packr, Encoder, addExtension, pack, encode, NEVER, ALWAYS, DECIMAL_ROUND, DECIMAL_FIT } from './pack.js'
-export { Unpackr, Decoder, C1, unpack, unpackMultiple, decode, FLOAT32_OPTIONS, clearSource, roundFloat32 } from './unpack.js'
+export { Packr, Encoder, addExtension, pack, encode, NEVER, ALWAYS, DECIMAL_ROUND, DECIMAL_FIT, REUSE_BUFFER_MODE, RESET_BUFFER_MODE, RESERVE_START_SPACE } from './pack.js'
+export { Unpackr, Decoder, C1, unpack, unpackMultiple, decode, FLOAT32_OPTIONS, clearSource, roundFloat32, isNativeAccelerationEnabled } from './unpack.js'
+import './struct.js'
 export { PackrStream, UnpackrStream, PackrStream as EncoderStream, UnpackrStream as DecoderStream } from './stream.js'
 export { decodeIter, encodeIter } from './iterators.js'
 export const useRecords = false
@@ -7,18 +8,18 @@ export const mapsAsObjects = true
 import { setExtractor } from './unpack.js'
 import { createRequire } from 'module'
 
-const extractor = tryRequire('msgpackr-extract')
-if (extractor)
-	setExtractor(extractor.extractStrings)
+const nativeAccelerationDisabled = process.env.MSGPACKR_NATIVE_ACCELERATION_DISABLED !== undefined && process.env.MSGPACKR_NATIVE_ACCELERATION_DISABLED.toLowerCase() === 'true';
 
-function tryRequire(moduleId) {
+if (!nativeAccelerationDisabled) {
+	let extractor
 	try {
-		let require = createRequire(import.meta.url)
-		return require(moduleId)
-	} catch (error) {
-		if (typeof window == 'undefined')
-			console.warn('Native extraction module not loaded, msgpackr will still run, but with decreased performance. ' + error.message.split('\n')[0])
+		if (typeof require == 'function')
+			extractor = require('msgpackr-extract')
 		else
-			console.warn('For browser usage, directly use msgpackr/unpack or msgpackr/pack modules. ' + error.message.split('\n')[0])
+			extractor = createRequire(import.meta.url)('msgpackr-extract')
+		if (extractor)
+			setExtractor(extractor.extractStrings)
+	} catch (error) {
+		// native module is optional
 	}
 }

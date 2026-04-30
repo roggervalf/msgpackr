@@ -38,8 +38,12 @@ node_modules/
 jspm_packages/
 
 package-lock.json
+yarn.lock
 # Typescript v1 declaration files
 typings/
+index.d.cts
+pack.d.cts
+unpack.d.cts
 
 # Optional npm cache directory
 .npm
@@ -63,5 +67,7 @@ tests/samples
 # Visual Studio Code directory
 .vscode
 .vs
+.idea
 
 build
+dist/test.js

@@ -1,4 +1,3 @@
-"use strict"
 var decoder
 try {
 	decoder = new TextDecoder()
@@ -15,6 +14,7 @@ var currentStructures
 var srcString
 var srcStringStart = 0
 var srcStringEnd = 0
+var bundledStrings
 var referenceMap
 var currentExtensions = []
 var dataView
@@ -26,45 +26,75 @@ export class C1Type {}
 export const C1 = new C1Type()
 C1.name = 'MessagePack 0xC1'
 var sequentialMode = false
+var inlineObjectReadThreshold = 2
+var readStruct, onLoadedStructures, onSaveState
+var BlockedFunction // we use search and replace to change the next call to BlockedFunction to avoid CSP issues for
 
 export class Unpackr {
 	constructor(options) {
 		if (options) {
 			if (options.useRecords === false && options.mapsAsObjects === undefined)
 				options.mapsAsObjects = true
+			if (options.sequential && options.trusted !== false) {
+				options.trusted = true;
+				if (!options.structures && options.useRecords != false) {
+					options.structures = []
+					if (!options.maxSharedStructures)
+						options.maxSharedStructures = 0
+				}
+			}
 			if (options.structures)
 				options.structures.sharedLength = options.structures.length
 			else if (options.getStructures) {
 				(options.structures = []).uninitialized = true // this is what we use to denote an uninitialized structures
 				options.structures.sharedLength = 0
 			}
+			if (options.int64AsNumber) {
+				options.int64AsType = 'number'
+			}
 		}
 		Object.assign(this, options)
 	}
-	unpack(source, end) {
+	unpack(source, options) {
 		if (src) {
 			// re-entrant execution, save the state and restore it after we do this unpack
 			return saveState(() => {
 				clearSource()
-				return this ? this.unpack(source, end) : Unpackr.prototype.unpack.call(defaultOptions, source, end)
+				return this ? this.unpack(source, options) : Unpackr.prototype.unpack.call(defaultOptions, source, options)
 			})
 		}
-		srcEnd = end > -1 ? end : source.length
-		position = 0
+		if (!source.buffer && source.constructor === ArrayBuffer)
+			source = typeof Buffer !== 'undefined' ? Buffer.from(source) : new Uint8Array(source);
+		if (typeof options === 'object') {
+			srcEnd = options.end || source.length
+			position = options.start || 0
+		} else {
+			position = 0
+			srcEnd = options > -1 ? options : source.length
+		}
 		stringPosition = 0
 		srcStringEnd = 0
 		srcString = null
 		strings = EMPTY_ARRAY
+		bundledStrings = null
 		src = source
 		// this provides cached access to the data view for a buffer if it is getting reused, which is a recommend
 		// technique for getting data from a database where it can be copied into an existing buffer instead of creating
 		// new ones
-		dataView = source.dataView || (source.dataView = new DataView(source.buffer, source.byteOffset, source.byteLength))
-		if (this) {
+		try {
+			dataView = source.dataView || (source.dataView = new DataView(source.buffer, source.byteOffset, source.byteLength))
+		} catch(error) {
+			// if it doesn't have a buffer, maybe it is the wrong type of object
+			src = null
+			if (source instanceof Uint8Array)
+				throw error
+			throw new Error('Source must be a Uint8Array or Buffer but was a ' + ((source && typeof source == 'object') ? source.constructor.name : typeof source))
+		}
+		if (this instanceof Unpackr) {
 			currentUnpackr = this
 			if (this.structures) {
 				currentStructures = this.structures
-				return checkedRead()
+				return checkedRead(options)
 			} else if (!currentStructures || currentStructures.length > 0) {
 				currentStructures = []
 			}
@@ -73,7 +103,7 @@ export class Unpackr {
 			if (!currentStructures || currentStructures.length > 0)
 				currentStructures = []
 		}
-		return checkedRead()
+		return checkedRead(options)
 	}
 	unpackMultiple(source, forEach) {
 		let values, lastPosition = 0
@@ -82,10 +112,10 @@ export class Unpackr {
 			let size = source.length
 			let value = this ? this.unpack(source, size) : defaultUnpackr.unpack(source, size)
 			if (forEach) {
-				forEach(value)
+				if (forEach(value, lastPosition, position) === false) return;
 				while(position < size) {
 					lastPosition = position
-					if (forEach(checkedRead()) === false) {
+					if (forEach(checkedRead(), lastPosition, position) === false) {
 						return
 					}
 				}
@@ -108,7 +138,11 @@ export class Unpackr {
 		}
 	}
 	_mergeStructures(loadedStructures, existingStructures) {
+		if (onLoadedStructures)
+			loadedStructures = onLoadedStructures.call(this, loadedStructures);
 		loadedStructures = loadedStructures || []
+		if (Object.isFrozen(loadedStructures))
+			loadedStructures = loadedStructures.map(structure => structure.slice(0))
 		for (let i = 0, l = loadedStructures.length; i < l; i++) {
 			let structure = loadedStructures[i]
 			if (structure) {
@@ -131,24 +165,41 @@ export class Unpackr {
 		}
 		return this.structures = loadedStructures
 	}
-	decode(source, end) {
-		return this.unpack(source, end)
+	decode(source, options) {
+		return this.unpack(source, options)
 	}
 }
 export function getPosition() {
 	return position
 }
-export function checkedRead() {
+export function checkedRead(options) {
 	try {
 		if (!currentUnpackr.trusted && !sequentialMode) {
 			let sharedLength = currentStructures.sharedLength || 0
 			if (sharedLength < currentStructures.length)
 				currentStructures.length = sharedLength
 		}
-		let result = read()
+		let result
+		if (currentUnpackr.randomAccessStructure && src[position] < 0x40 && src[position] >= 0x20 && readStruct) {
+			result = readStruct(src, position, srcEnd, currentUnpackr)
+			src = null // dispose of this so that recursive unpack calls don't save state
+			if (!(options && options.lazy) && result)
+				result = result.toJSON()
+			position = srcEnd
+		} else
+			result = read()
+		if (bundledStrings) { // bundled strings to skip past
+			position = bundledStrings.postBundlePosition
+			bundledStrings = null
+		}
+		if (sequentialMode)
+			// we only need to restore the structures if there was an error, but if we completed a read,
+			// we can clear this out and keep the structures we read
+			currentStructures.restoreStructures = null
+
 		if (position == srcEnd) {
 			// finished reading this source, cleanup references
-			if (currentStructures.restoreStructures)
+			if (currentStructures && currentStructures.restoreStructures)
 				restoreStructures()
 			currentStructures = null
 			src = null
@@ -156,19 +207,23 @@ export function checkedRead() {
 				referenceMap = null
 		} else if (position > srcEnd) {
 			// over read
-			let error = new Error('Unexpected end of MessagePack data')
-			error.incomplete = true
-			throw error
+			throw new Error('Unexpected end of MessagePack data')
 		} else if (!sequentialMode) {
-			throw new Error('Data read, but end of buffer not reached')
+			let jsonView;
+			try {
+				jsonView = JSON.stringify(result, (_, value) => typeof value === "bigint" ? `${value}n` : value).slice(0, 100)
+			} catch(error) {
+				jsonView = '(JSON view not available ' + error + ')'
+			}
+			throw new Error('Data read, but end of buffer not reached ' + jsonView)
 		}
 		// else more to read, but we are reading sequentially, so don't clear source yet
 		return result
 	} catch(error) {
-		if (currentStructures.restoreStructures)
+		if (currentStructures && currentStructures.restoreStructures)
 			restoreStructures()
 		clearSource()
-		if (error instanceof RangeError || error.message.startsWith('Unexpected end of buffer')) {
+		if (error instanceof RangeError || error.message.startsWith('Unexpected end of buffer') || position > srcEnd) {
 			error.incomplete = true
 		}
 		throw error
@@ -205,7 +260,10 @@ export function read() {
 			if (currentUnpackr.mapsAsObjects) {
 				let object = {}
 				for (let i = 0; i < token; i++) {
-					object[readKey()] = read()
+					let key = readKey()
+					if (key === '__proto__')
+						key = '__proto_'
+					object[key] = read()
 				}
 				return object
 			} else {
@@ -221,6 +279,8 @@ export function read() {
 			for (let i = 0; i < token; i++) {
 				array[i] = read()
 			}
+			if (currentUnpackr.freezeData)
+				return Object.freeze(array)
 			return array
 		}
 	} else if (token < 0xc0) {
@@ -240,12 +300,23 @@ export function read() {
 		let value
 		switch (token) {
 			case 0xc0: return null
-			case 0xc1: return C1; // "never-used", return special object to denote that
+			case 0xc1:
+				if (bundledStrings) {
+					value = read() // followed by the length of the string in characters (not bytes!)
+					if (value > 0)
+						return bundledStrings[1].slice(bundledStrings.position1, bundledStrings.position1 += value)
+					else
+						return bundledStrings[0].slice(bundledStrings.position0, bundledStrings.position0 -= value)
+				}
+				return C1; // "never-used", return special object to denote that
 			case 0xc2: return false
 			case 0xc3: return true
 			case 0xc4:
 				// bin 8
-				return readBin(src[position++])
+				value = src[position++]
+				if (value === undefined)
+					throw new Error('Unexpected end of buffer')
+				return readBin(value)
 			case 0xc5:
 				// bin 16
 				value = dataView.getUint16(position)
@@ -295,10 +366,16 @@ export function read() {
 				position += 4
 				return value
 			case 0xcf:
-				if (currentUnpackr.uint64AsNumber)
-					return src[position++] * 0x100000000000000 + src[position++] * 0x1000000000000 + src[position++] * 0x10000000000 + src[position++] * 0x100000000 +
-						src[position++] * 0x1000000 + (src[position++] << 16) + (src[position++] << 8) + src[position++]
-				value = dataView.getBigUint64(position)
+				if (currentUnpackr.int64AsType === 'number') {
+					value = dataView.getUint32(position) * 0x100000000
+					value += dataView.getUint32(position + 4)
+				} else if (currentUnpackr.int64AsType === 'string') {
+					value = dataView.getBigUint64(position).toString()
+				} else if (currentUnpackr.int64AsType === 'auto') {
+					value = dataView.getBigUint64(position)
+					if (value<=BigInt(2)<<BigInt(52)) value=Number(value)
+				} else
+					value = dataView.getBigUint64(position)
 				position += 8
 				return value
 
@@ -314,7 +391,16 @@ export function read() {
 				position += 4
 				return value
 			case 0xd3:
-				value = dataView.getBigInt64(position)
+				if (currentUnpackr.int64AsType === 'number') {
+					value = dataView.getInt32(position) * 0x100000000
+					value += dataView.getUint32(position + 4)
+				} else if (currentUnpackr.int64AsType === 'string') {
+					value = dataView.getBigInt64(position).toString()
+				} else if (currentUnpackr.int64AsType === 'auto') {
+					value = dataView.getBigInt64(position)
+					if (value>=BigInt(-2)<<BigInt(52)&&value<=BigInt(2)<<BigInt(52)) value=Number(value)
+				} else
+					value = dataView.getBigInt64(position)
 				position += 8
 				return value
 
@@ -414,17 +500,29 @@ const validName = /^[a-zA-Z_$][a-zA-Z\d_$]*$/
 function createStructureReader(structure, firstId) {
 	function readObject() {
 		// This initial function is quick to instantiate, but runs slower. After several iterations pay the cost to build the faster function
-		if (readObject.count++ > 2) {
-			let readObject = structure.read = (new Function('r', 'return function(){return {' + structure.map(key => validName.test(key) ? key + ':r()' : ('[' + JSON.stringify(key) + ']:r()')).join(',') + '}}'))(read)
+		if (readObject.count++ > inlineObjectReadThreshold) {
+			let optimizedReadObject
+			try {
+				optimizedReadObject = structure.read = (new Function('r', 'return function(){return ' + (currentUnpackr.freezeData ? 'Object.freeze' : '') +
+					'({' + structure.map(key => key === '__proto__' ? '__proto_:r()' : validName.test(key) ? key + ':r()' : ('[' + JSON.stringify(key) + ']:r()')).join(',') + '})}'))(read)
+			} catch(error) {
+				// in CF workers, the new Function call could begin to fail at any point in time
+				inlineObjectReadThreshold = Infinity // disable going forward
+				return readObject(); // recursively try again
+			}
 			if (structure.highByte === 0)
 				structure.read = createSecondByteReader(firstId, structure.read)
-			return readObject() // second byte is already read, if there is one so immediately read object
+			return optimizedReadObject() // second byte is already read, if there is one so immediately read object
 		}
 		let object = {}
 		for (let i = 0, l = structure.length; i < l; i++) {
 			let key = structure[i]
+			if (key === '__proto__')
+				key = '__proto_'
 			object[key] = read()
 		}
+		if (currentUnpackr.freezeData)
+			return Object.freeze(object);
 		return object
 	}
 	readObject.count = 0
@@ -450,7 +548,7 @@ const createSecondByteReader = (firstId, read0) => {
 	}
 }
 
-function loadStructures() {
+export function loadStructures() {
 	let loadedStructures = saveState(() => {
 		// save the state in case getStructures modifies our buffer
 		src = null
@@ -463,8 +561,10 @@ var readFixedString = readStringJS
 var readString8 = readStringJS
 var readString16 = readStringJS
 var readString32 = readStringJS
+export let isNativeAccelerationEnabled = false
 
 export function setExtractor(extractStrings) {
+	isNativeAccelerationEnabled = true
 	readFixedString = readString(1)
 	readString8 = readString(2)
 	readString16 = readString(3)
@@ -473,7 +573,10 @@ export function setExtractor(extractStrings) {
 		return function readString(length) {
 			let string = strings[stringPosition++]
 			if (string == null) {
-				let extraction = extractStrings(position - headerLength, srcEnd, src)
+				if (bundledStrings)
+					return readStringJS(length)
+				let byteOffset = src.byteOffset
+				let extraction = extractStrings(position - headerLength + byteOffset, srcEnd + byteOffset, src.buffer)
 				if (typeof extraction == 'string') {
 					string = extraction
 					strings = EMPTY_ARRAY
@@ -518,26 +621,45 @@ function readStringJS(length) {
 		} else if ((byte1 & 0xe0) === 0xc0) {
 			// 2 bytes
 			const byte2 = src[position++] & 0x3f
-			units.push(((byte1 & 0x1f) << 6) | byte2)
+			const codePoint = ((byte1 & 0x1f) << 6) | byte2
+			// Reject overlong encoding: 2-byte sequences must encode values >= 0x80
+			if (codePoint < 0x80) {
+				units.push(0xFFFD) // replacement character
+			} else {
+				units.push(codePoint)
+			}
 		} else if ((byte1 & 0xf0) === 0xe0) {
 			// 3 bytes
 			const byte2 = src[position++] & 0x3f
 			const byte3 = src[position++] & 0x3f
-			units.push(((byte1 & 0x1f) << 12) | (byte2 << 6) | byte3)
+			const codePoint = ((byte1 & 0x1f) << 12) | (byte2 << 6) | byte3
+			// Reject overlong encoding: 3-byte sequences must encode values >= 0x800
+			// Also reject surrogates (0xD800-0xDFFF)
+			if (codePoint < 0x800 || (codePoint >= 0xD800 && codePoint <= 0xDFFF)) {
+				units.push(0xFFFD) // replacement character
+			} else {
+				units.push(codePoint)
+			}
 		} else if ((byte1 & 0xf8) === 0xf0) {
 			// 4 bytes
 			const byte2 = src[position++] & 0x3f
 			const byte3 = src[position++] & 0x3f
 			const byte4 = src[position++] & 0x3f
 			let unit = ((byte1 & 0x07) << 0x12) | (byte2 << 0x0c) | (byte3 << 0x06) | byte4
-			if (unit > 0xffff) {
+			// Reject overlong encoding: 4-byte sequences must encode values >= 0x10000
+			// Also reject values > 0x10FFFF (maximum valid Unicode)
+			if (unit < 0x10000 || unit > 0x10FFFF) {
+				units.push(0xFFFD) // replacement character
+			} else if (unit > 0xffff) {
 				unit -= 0x10000
 				units.push(((unit >>> 10) & 0x3ff) | 0xd800)
 				unit = 0xdc00 | (unit & 0x3ff)
+				units.push(unit)
+			} else {
+				units.push(unit)
 			}
-			units.push(unit)
 		} else {
-			units.push(byte1)
+			units.push(0xFFFD) // replacement character for invalid lead byte
 		}
 
 		if (units.length >= 0x1000) {
@@ -552,12 +674,24 @@ function readStringJS(length) {
 
 	return result
 }
+export function readString(source, start, length) {
+	let existingSrc = src;
+	src = source;
+	position = start;
+	try {
+		return readStringJS(length);
+	} finally {
+		src = existingSrc;
+	}
+}
 
 function readArray(length) {
 	let array = new Array(length)
 	for (let i = 0; i < length; i++) {
 		array[i] = read()
 	}
+	if (currentUnpackr.freezeData)
+		return Object.freeze(array)
 	return array
 }
 
@@ -565,7 +699,10 @@ function readMap(length) {
 	if (currentUnpackr.mapsAsObjects) {
 		let object = {}
 		for (let i = 0; i < length; i++) {
-			object[readKey()] = read()
+			let key = readKey()
+			if (key === '__proto__')
+				key = '__proto_';
+			object[key] = read()
 		}
 		return object
 	} else {
@@ -584,12 +721,12 @@ function longStringInJS(length) {
 	for (let i = 0; i < length; i++) {
 		const byte = src[position++];
 		if ((byte & 0x80) > 0) {
-			position = start
-    			return
-    		}
-    		bytes[i] = byte
-    	}
-    	return fromCharCode.apply(String, bytes)
+				position = start
+				return
+			}
+			bytes[i] = byte
+		}
+		return fromCharCode.apply(String, bytes)
 }
 function shortStringInJS(length) {
 	if (length < 4) {
@@ -731,6 +868,36 @@ function shortStringInJS(length) {
 	}
 }
 
+function readOnlyJSString() {
+	let token = src[position++]
+	let length
+	if (token < 0xc0) {
+		// fixstr
+		length = token - 0xa0
+	} else {
+		switch(token) {
+			case 0xd9:
+			// str 8
+				length = src[position++]
+				break
+			case 0xda:
+			// str 16
+				length = dataView.getUint16(position)
+				position += 2
+				break
+			case 0xdb:
+			// str 32
+				length = dataView.getUint32(position)
+				position += 4
+				break
+			default:
+				throw new Error('Expected string')
+		}
+	}
+	return readStringJS(length)
+}
+
+
 function readBin(length) {
 	return currentUnpackr.copyBuffers ?
 		// specifically use the copying slice (not the node one)
@@ -740,7 +907,15 @@ function readBin(length) {
 function readExt(length) {
 	let type = src[position++]
 	if (currentExtensions[type]) {
-		return currentExtensions[type](src.subarray(position, position += length))
+		let end
+		return currentExtensions[type](src.subarray(position, end = (position += length)), (readPosition) => {
+			position = readPosition;
+			try {
+				return read();
+			} finally {
+				position = end;
+			}
+		})
 	}
 	else
 		throw new Error('Unknown extension type ' + type)
@@ -758,7 +933,7 @@ function readKey() {
 			return readFixedString(length)
 	} else { // not cacheable, go back and do a standard read
 		position--
-		return read()
+		return asSafeString(read())
 	}
 	let key = ((length << 5) ^ (length > 1 ? dataView.getUint16(position) : length > 0 ? src[position] : 0)) & 0xfff
 	let entry = keyCache[key]
@@ -810,56 +985,122 @@ function readKey() {
 	return entry.string = readFixedString(length)
 }
 
+function asSafeString(property) {
+	// protect against expensive (DoS) string conversions
+	if (typeof property === 'string') return property;
+	if (typeof property === 'number' || typeof property === 'boolean' || typeof property === 'bigint') return property.toString();
+	if (property == null) return property + '';
+	if (currentUnpackr.allowArraysInMapKeys && Array.isArray(property) && property.flat().every(item => ['string', 'number', 'boolean', 'bigint'].includes(typeof item))) {
+		return property.flat().toString();
+	}
+	throw new Error(`Invalid property type for record: ${typeof property}`);
+}
 // the registration of the record definition extension (as "r")
 const recordDefinition = (id, highByte) => {
-	var structure = read()
+	let structure = read().map(asSafeString) // ensure that all keys are strings and
+	// that the array is mutable
 	let firstByte = id
 	if (highByte !== undefined) {
 		id = id < 32 ? -((highByte << 5) + id) : ((highByte << 5) + id)
 		structure.highByte = highByte
 	}
 	let existingStructure = currentStructures[id]
-	if (existingStructure && existingStructure.isShared) {
+	// If it is a shared structure, we need to restore any changes after reading.
+	// Also in sequential mode, we may get incomplete reads and thus errors, and we need to restore
+	// to the state prior to an incomplete read in order to properly resume.
+	if (existingStructure && (existingStructure.isShared || sequentialMode)) {
 		(currentStructures.restoreStructures || (currentStructures.restoreStructures = []))[id] = existingStructure
 	}
 	currentStructures[id] = structure
 	structure.read = createStructureReader(structure, firstByte)
 	return structure.read()
 }
-var glbl = typeof self == 'object' ? self : global
 currentExtensions[0] = () => {} // notepack defines extension 0 to mean undefined, so use that as the default here
 currentExtensions[0].noBuffer = true
 
+currentExtensions[0x42] = data => {
+	let headLength = (data.byteLength % 8) || 8
+	let head = BigInt(data[0] & 0x80 ? data[0] - 0x100 : data[0])
+	for (let i = 1; i < headLength; i++) {
+		head <<= BigInt(8)
+		head += BigInt(data[i])
+	}
+	if (data.byteLength !== headLength) {
+		let view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+		let decode = (start, end) => {
+			let length = end - start
+			if (length <= 40) {
+				let out = view.getBigUint64(start)
+				for (let i = start + 8; i < end; i += 8) {
+					out <<= BigInt(64)
+					out |= view.getBigUint64(i)
+				}
+				return out
+			}
+			// if (length === 8) return view.getBigUint64(start)
+			let middle = start + (length >> 4 << 3)
+			let left = decode(start, middle)
+			let right = decode(middle, end)
+			return (left << BigInt((end - middle) * 8)) | right
+		}
+		head = (head << BigInt((view.byteLength - headLength) * 8)) | decode(headLength, view.byteLength)
+	}
+	return head
+}
+
+let errors = {
+	Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError, AggregateError: typeof AggregateError === 'function' ? AggregateError : null,
+}
 currentExtensions[0x65] = () => {
 	let data = read()
-	return (glbl[data[0]] || Error)(data[1])
+	if (!errors[data[0]]) {
+		let error = Error(data[1], { cause: data[2] })
+		error.name = data[0]
+		return error
+	}
+	return errors[data[0]](data[1], { cause: data[2] })
 }
 
 currentExtensions[0x69] = (data) => {
 	// id extension (for structured clones)
+	if (currentUnpackr.structuredClone === false) throw new Error('Structured clone extension is disabled')
 	let id = dataView.getUint32(position - 4)
 	if (!referenceMap)
 		referenceMap = new Map()
 	let token = src[position]
 	let target
-	// TODO: handle Maps, Sets, and other types that can cycle; this is complicated, because you potentially need to read
-	// ahead past references to record structure definitions
+	// TODO: handle any other types that can cycle and make the code more robust if there are other extensions
 	if (token >= 0x90 && token < 0xa0 || token == 0xdc || token == 0xdd)
 		target = []
+	else if (token >= 0x80 && token < 0x90 || token == 0xde || token == 0xdf)
+		target = new Map()
+	else if ((token >= 0xc7 && token <= 0xc9 || token >= 0xd4 && token <= 0xd8) && src[position + 1] === 0x73)
+		target = new Set()
 	else
 		target = {}
 
 	let refEntry = { target } // a placeholder object
 	referenceMap.set(id, refEntry)
 	let targetProperties = read() // read the next value as the target object to id
-	if (refEntry.used) // there is a cycle, so we have to assign properties to original target
-		return Object.assign(target, targetProperties)
-	refEntry.target = targetProperties // the placeholder wasn't used, replace with the deserialized one
-	return targetProperties // no cycle, can just use the returned read object
+	if (!refEntry.used) {
+		// no cycle, can just use the returned read object
+		return refEntry.target = targetProperties // replace the placeholder with the real one
+	} else {
+		// there is a cycle, so we have to assign properties to original target
+		Object.assign(target, targetProperties)
+	}
+
+	// copy over map/set entries if we're able to
+	if (target instanceof Map)
+		for (let [k, v] of targetProperties.entries()) target.set(k, v)
+	if (target instanceof Set)
+		for (let i of Array.from(targetProperties)) target.add(i)
+	return target
 }
 
 currentExtensions[0x70] = (data) => {
 	// pointer extension (for structured clones)
+	if (currentUnpackr.structuredClone === false) throw new Error('Structured clone extension is disabled')
 	let id = dataView.getUint32(position - 4)
 	let refEntry = referenceMap.get(id)
 	refEntry.used = true
@@ -870,17 +1111,36 @@ currentExtensions[0x73] = () => new Set(read())
 
 export const typedArrays = ['Int8','Uint8','Uint8Clamped','Int16','Uint16','Int32','Uint32','Float32','Float64','BigInt64','BigUint64'].map(type => type + 'Array')
 
+let glbl = typeof globalThis === 'object' ? globalThis : window;
 currentExtensions[0x74] = (data) => {
 	let typeCode = data[0]
+	// we always have to slice to get a new ArrayBuffer that is aligned
+	let buffer = Uint8Array.prototype.slice.call(data, 1).buffer
+
 	let typedArrayName = typedArrays[typeCode]
-	if (!typedArrayName)
+	if (!typedArrayName) {
+		if (typeCode === 16) return buffer
+		if (typeCode === 17) return new DataView(buffer)
 		throw new Error('Could not find typed array for code ' + typeCode)
-	// we have to always slice/copy here to get a new ArrayBuffer that is word/byte aligned
-	return new glbl[typedArrayName](Uint8Array.prototype.slice.call(data, 1).buffer)
+	}
+	return new glbl[typedArrayName](buffer)
 }
 currentExtensions[0x78] = () => {
 	let data = read()
 	return new RegExp(data[0], data[1])
+}
+const TEMP_BUNDLE = []
+currentExtensions[0x62] = (data) => {
+	let dataSize = (data[0] << 24) + (data[1] << 16) + (data[2] << 8) + data[3]
+	let dataPosition = position
+	position += dataSize - data.length
+	bundledStrings = TEMP_BUNDLE
+	bundledStrings = [readOnlyJSString(), readOnlyJSString()]
+	bundledStrings.position0 = 0
+	bundledStrings.position1 = 0
+	bundledStrings.postBundlePosition = position
+	position = dataPosition
+	return read()
 }
 
 currentExtensions[0xff] = (data) => {
@@ -891,17 +1151,19 @@ currentExtensions[0xff] = (data) => {
 		return new Date(
 			((data[0] << 22) + (data[1] << 14) + (data[2] << 6) + (data[3] >> 2)) / 1000000 +
 			((data[3] & 0x3) * 0x100000000 + data[4] * 0x1000000 + (data[5] << 16) + (data[6] << 8) + data[7]) * 1000)
-	else if (data.length == 12)// TODO: Implement support for negative
+	else if (data.length == 12)
 		return new Date(
 			((data[0] << 24) + (data[1] << 16) + (data[2] << 8) + data[3]) / 1000000 +
 			(((data[4] & 0x80) ? -0x1000000000000 : 0) + data[6] * 0x10000000000 + data[7] * 0x100000000 + data[8] * 0x1000000 + (data[9] << 16) + (data[10] << 8) + data[11]) * 1000)
 	else
-		throw new Error('Invalid timestamp length')
-} // notepack defines extension 0 to mean undefined, so use that as the default here
+		return new Date('invalid')
+}
 // registration of bulk record definition?
 // currentExtensions[0x52] = () =>
 
 function saveState(callback) {
+	if (onSaveState)
+		onSaveState();
 	let savedSrcEnd = srcEnd
 	let savedPosition = position
 	let savedStringPosition = stringPosition
@@ -910,6 +1172,7 @@ function saveState(callback) {
 	let savedSrcString = srcString
 	let savedStrings = strings
 	let savedReferenceMap = referenceMap
+	let savedBundledStrings = bundledStrings
 
 	// TODO: We may need to revisit this if we do more external calls to user code (since it could be slow)
 	let savedSrc = new Uint8Array(src.slice(0, srcEnd)) // we copy the data in case it changes while external data is processed
@@ -926,6 +1189,7 @@ function saveState(callback) {
 	srcString = savedSrcString
 	strings = savedStrings
 	referenceMap = savedReferenceMap
+	bundledStrings = savedBundledStrings
 	src = savedSrc
 	sequentialMode = savedSequentialMode
 	currentStructures = savedStructures
@@ -951,8 +1215,6 @@ export const mult10 = new Array(147) // this is a table matching binary exponent
 for (let i = 0; i < 256; i++) {
 	mult10[i] = +('1e' + Math.floor(45.15 - i * 0.30103))
 }
-export const useRecords = false
-export const mapsAsObjects = true
 export const Decoder = Unpackr
 var defaultUnpackr = new Unpackr({ useRecords: false })
 export const unpack = defaultUnpackr.unpack
@@ -970,4 +1232,9 @@ export function roundFloat32(float32Number) {
 	f32Array[0] = float32Number
 	let multiplier = mult10[((u8Array[3] & 0x7f) << 1) | (u8Array[2] >> 7)]
 	return ((multiplier * float32Number + (float32Number > 0 ? 0.5 : -0.5)) >> 0) / multiplier
+}
+export function setReadStruct(updatedReadStruct, loadedStructs, saveState) {
+	readStruct = updatedReadStruct;
+	onLoadedStructures = loadedStructs;
+	onSaveState = saveState;
 }

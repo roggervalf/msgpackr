@@ -1,11 +1,11 @@
 # msgpackr
-[![license](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 [![npm version](https://img.shields.io/npm/v/msgpackr.svg?style=flat-square)](https://www.npmjs.org/package/msgpackr)
+[![npm version](https://img.shields.io/npm/dw/msgpackr)](https://www.npmjs.org/package/msgpackr)
 [![encode](https://img.shields.io/badge/encode-1.5GB%2Fs-yellow)](benchmark.md)
 [![decode](https://img.shields.io/badge/decode-2GB%2Fs-yellow)](benchmark.md)
 [![types](https://img.shields.io/npm/types/msgpackr)](README.md)
 [![module](https://img.shields.io/badge/module-ESM%2FCJS-blue)](README.md)
-
+[![license](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 
 The msgpackr package is an extremely fast MessagePack NodeJS/JavaScript implementation. Currently, it is significantly faster than any other known implementations, faster than Avro (for JS), and generally faster than native V8 JSON.stringify/parse, on NodeJS. It also includes an optional record extension (the `r` in msgpackr), for defining record structures that makes MessagePack even faster and more compact, often over twice as fast as even native JSON functions, several times faster than other JS implementations, and 15-50% more compact. See the performance section for more details. Structured cloning (with support for cyclical references) is also supported through optional extensions.
 
@@ -38,7 +38,7 @@ stream.write(myData);
 ```
 Or for a full example of sending and receiving data on a stream:
 ```js
-import { PackrStream } from 'msgpackr';
+import { PackrStream, UnpackrStream } from 'msgpackr';
 let sendingStream = new PackrStream();
 let receivingStream = new UnpackrStream();
 // we are just piping to our own stream, but normally you would send and
@@ -51,8 +51,8 @@ receivingStream.on('data', (data) => {
 ```
 The `PackrStream` and `UnpackrStream` instances  will have also the record structure extension enabled by default (see below).
 
-## Deno Usage
-Msgpackr modules are standard ESM modules and can be loaded directly from github (https://raw.githubusercontent.com/kriszyp/msgpackr/master/index.js) or downloaded and used directly in Deno. The standard pack/encode and unpack/decode functionality is available on Deno, like other platforms.
+## Deno and Bun Usage
+Msgpackr modules are standard ESM modules and can be loaded directly from the [deno.land registry for msgpackr](https://deno.land/x/msgpackr) for use in Deno or using the NPM module loader with `import { unpack } from 'npm:msgpackr'`. The standard pack/encode and unpack/decode functionality is available on Deno, like other platforms. msgpackr can be used like any other package on Bun.
 
 ## Browser Usage
 Msgpackr works as standalone JavaScript as well, and runs on modern browsers. It includes a bundled script, at `dist/index.js` for ease of direct loading:
@@ -66,6 +66,9 @@ For module-based development, it is recommended that you directly import the mod
 ```js
 import { unpack } from 'msgpackr/unpack' // if you only need to unpack
 ```
+
+The package also includes a minified bundle in index.min.js. 
+Additionally, the package includes a version that excludes dynamic code evaluation called index-no-eval.js, for situations where Content Security Policy (CSP) forbids eval/Function in code. The dynamic evaluation provides important performance optimizations (for records), so is not recommended unless required by CSP policy.
 
 ## Structured Cloning
 You can also use msgpackr for [structured cloning](https://html.spec.whatwg.org/multipage/structured-data.html). By enabling the `structuredClone` option, you can include references to other objects or cyclic references, and object identity will be preserved. Structured cloning also enables preserving certain typed objects like `Error`, `Set`, `RegExp` and TypedArray instances. For example:
@@ -99,7 +102,7 @@ packr.pack(bigDataWithLotsOfObjects);
 
 Another way to further leverage the benefits of the msgpackr record structures is to use streams that naturally allow for data to reuse based on previous record structures. The stream classes have the record structure extension enabled by default and provide excellent out-of-the-box performance.
 
-When creating a new `Packr`, `Unpackr`, `PackrStream`, or `UnpackrStream` instance, we can enable or disable the record structure extension with the `useRecords` property. When this is `false`, the record structure extension will be disabled (standard/compatibility mode), and all objects will revert to being serialized using MessageMap `map`s, and all `map`s will be deserialized to JS `Object`s as properties (like the standalone `pack` and `unpack` functions).
+When creating a new `Packr`, `Unpackr`, `PackrStream`, or `UnpackrStream` instance, we can enable or disable the record structure extension with the `useRecords` property. When this is `false`, the record structure extension will be disabled (standard/compatibility mode), and all objects will revert to being serialized using MessagePack `map`s, and all `map`s will be deserialized to JS `Object`s as properties (like the standalone `pack` and `unpack` functions).
 
 Streaming with record structures works by encoding a structure the first time it is seen in a stream and referencing the structure in later messages that are sent across that stream. When an encoder can expect a decoder to understand previous structure references, this can be configured using the `sequential: true` flag, which is auto-enabled by streams, but can also be used with Packr instances.
 
@@ -152,20 +155,43 @@ unpackMultiple(data, (value) => {
 })
 ```
 
+If you need to know the start and end offsets of the unpacked values, these are
+provided as optional parameters in the callback:
+```js
+let data = new Uint8Array([1, 2, 3]) // encodings of values 1, 2, and 3
+unpackMultiple(data, (value,start,end) => {
+	// called for each value
+	// `start` is the data buffer offset where the value was read from
+	// `end` is `start` plus the byte length of the encoded value
+	// return false if you wish to end the parsing
+})
+```
+
 ## Options
 The following options properties can be provided to the Packr or Unpackr constructor:
 
-* `useRecords` - Setting this to `false` disables the record extension and stores JavaScript objects as MessagePack maps, and unpacks maps as JavaScript `Object`s, which ensures compatibilty with other decoders.
+* `useRecords` - Setting this to `false` disables the record extension and stores JavaScript objects as MessagePack maps, and unpacks maps as JavaScript `Object`s, which ensures compatibilty with other decoders. Setting this to a function will use records for objects where `useRecords(object)` returns `true`.
 * `structures` - Provides the array of structures that is to be used for record extension, if you want the structures saved and used again. This array will be modified in place with new record structures that are serialized (if less than 32 structures are in the array).
-* `structuredClone` - This enables the structured cloning extensions that will encode object/cyclic references and additional built-in types/classes.
+* `moreTypes` - Enable serialization of additional built-in types/classes including typed arrays, `Set`s, `Map`s, and `Error`s.
+* `structuredClone` - This enables the structured cloning extensions that will encode object/cyclic references. `moreTypes` is enabled by default when this is enabled.
 * `mapsAsObjects` - If `true`, this will decode MessagePack maps and JS `Object`s with the map entries decoded to object properties. If `false`, maps are decoded as JavaScript `Map`s. This is disabled by default if `useRecords` is enabled (which allows `Map`s to be preserved), and is enabled by default if `useRecords` is disabled.
 * `useFloat32` - This will enable msgpackr to encode non-integer numbers as `float32`. See next section for possible values.
 * `variableMapSize` - This will use varying map size definition (fixmap, map16, map32) based on the number of keys when encoding objects, which yields slightly more compact encodings (for small objects), but is typically 5-10% slower during encoding. This is necessary if you need to use objects with more than 65535 keys. This is only relevant when record extension is disabled.
+* `bundleStrings` - If `true` this uses a custom extension that bundles strings together, so that they can be decoded more quickly on browsers and Deno that do not have access to the NodeJS addon. This a custom extension, so both encoder and decoder need to support this. This can yield significant decoding performance increases on browsers (30%-50%).
 * `copyBuffers` - When decoding a MessagePack with binary data (Buffers are encoded as binary data), copy the buffer rather than providing a slice/view of the buffer. If you want your input data to be collected or modified while the decoded embedded buffer continues to live on, you can use this option (there is extra overhead to copying).
 * `useTimestamp32` - Encode JS `Date`s in 32-bit format when possible by dropping the milliseconds. This is a more efficient encoding of dates. You can also cause dates to use 32-bit format by manually setting the milliseconds to zero (`date.setMilliseconds(0)`).
 * `sequential` - Encode structures in serialized data, and reference previously encoded structures with expectation that decoder will read the encoded structures in the same order as encoded, with `unpackMultiple`.
 * `largeBigIntToFloat` - If a bigint needs to be encoded that is larger than will fit in 64-bit integers, it will be encoded as a float-64 (otherwise will throw a RangeError).
+* `largeBigIntToString` - If a bigint needs to be encoded that is larger than will fit in 64-bit integers, it will be encoded as a string (otherwise will throw a RangeError).
+* `useBigIntExtension` - If a bigint needs to be encoded that is larger than will fit in 64-bit integers, it will be encoded using a custom extension that supports up to about 1000-bits of integer precision.
 * `encodeUndefinedAsNil` - Encodes a value of `undefined` as a MessagePack `nil`, the same as a `null`.
+* `int64AsType` - This will decode uint64 and int64 numbers as the specified type. The type can be `bigint` (default), `number`,  `string`, or `auto` (where range [-2^53...2^53] is represented by number and everything else by a bigint).
+* `skipValues` - This can be an array of property values that will indicate properties that should be skipped when serializing objects. For example, to mimic `JSON.stringify`'s behavior of skipping properties with a value of `undefined`, you can provide `skipValues: [undefined]`. Note, that this will only apply to serializing objects as standard MessagePack maps, not to records. Also, the array is checked by calling the `include` method, so you can provide an object with an `includes` if you want a custom function to skip values. 
+* `onInvalidDate` - This can be provided as function that will be called when an invalid date is provided. The function can throw an error, or return a value that will be encoded in place of the invalid date. If not provided, an invalid date will be encoded as an invalid timestamp (which decodes with msgpackr back to an invalid date).
+* `writeFunction` - This can be provided as function that will be called when a function is encountered. The function can throw an error, or return a value that will be encoded in place of the function. If not provided, a function will be encoded as undefined (similar to `JSON.stringify`).
+* `mapAsEmptyObject` - Encodes JS `Map`s as empty objects (for back-compat with older libraries).
+* `setAsEmptyObject` - Encodes JS `Set`s as empty objects (for back-compat with older libraries).
+* `allowArraysInMapKeys` - Allows arrays to be used as keys in Maps, as long as all elements are strings, numbers, booleans, or bigints. When enabled, such arrays are flattened and converted to a string representation.
 
 ### 32-bit Float Options
 By default all non-integer numbers are serialized as 64-bit float (double). This is fast, and ensures maximum precision. However, often real-world data doesn't not need 64-bits of precision, and using 32-bit encoding can be much more space efficient. There are several options that provide more efficient encodings. Using the decimal rounding options for encoding and decoding provides lossless storage of common decimal representations like 7.99, in more efficient 32-bit format (rather than 64-bit). The `useFloat32` property has several possible options, available from the module as constants:
@@ -176,13 +202,22 @@ const { ALWAYS, DECIMAL_ROUND, DECIMAL_FIT } = FLOAT32_OPTIONS;
 
 * `ALWAYS` (1) - Always will encode non-integers (absolute less than 2147483648) as 32-bit float.
 * `DECIMAL_ROUND` (3) - Always will encode non-integers as 32-bit float, and when decoding 32-bit float, round to the significant decimal digits (usually 7, but 6 or 8 digits for some ranges).
-* `DECIMAL_FIT` (4) - Only encode non-integers as 32-bit float if all significant digits (usually up to 7) can be unamiguously encoded as a 32-bit float, and decode/unpack with decimal rounding (same as above). This will ensure round-trip encoding/decoding without loss in precision and use 32-bit when possible.
+* `DECIMAL_FIT` (4) - Only encode non-integers as 32-bit float if all significant digits (usually up to 7) can be unambiguously encoded as a 32-bit float, and decode/unpack with decimal rounding (same as above). This will ensure round-trip encoding/decoding without loss in precision and uses 32-bit when possible.
 
 Note, that the performance is decreased with decimal rounding by about 20-25%, although if only 5% of your values are floating point, that will only have about a 1% impact overall.
 
-In addition, msgpackr exports a `roundFloat32(number)` function that can be used to round floating point numbers to the maximum significant decimal digits that can be stored in 32-bit float, just as DECIMAL_ROUND does when encoding. This can be useful for determine how a number will be stored prior to encoding it.
+In addition, msgpackr exports a `roundFloat32(number)` function that can be used to round floating point numbers to the maximum significant decimal digits that can be stored in 32-bit float, just as DECIMAL_ROUND does when decoding. This can be useful for determining how a number will be decoded prior to encoding it.
 
 ## Performance
+### Native Acceleration
+Msgpackr employs an optional native node-addon to accelerate the parsing of strings. This should be automatically installed and utilized on NodeJS. However, you can verify this by checking the `isNativeAccelerationEnabled` property that is exported from msgpackr. If this is `false`, the `msgpackr-extract` package may not have been properly installed, and you may want to verify that it is installed correctly:
+```js
+import { isNativeAccelerationEnabled } from 'msgpackr'
+if (!isNativeAccelerationEnabled)
+	console.warn('Native acceleration not enabled, verify that install finished properly')
+```
+
+### Benchmarks
 Msgpackr is fast. Really fast. Here is comparison with the next fastest JS projects using the benchmark tool from `msgpack-lite` (and the sample data is from some clinical research data we use that has a good mix of different value types and structures). It also includes comparison to V8 native JSON functionality, and JavaScript Avro (`avsc`, a very optimized Avro implementation):
 
 operation                                                  |   op   |   ms  |  op/s
@@ -237,7 +272,7 @@ addExtension({
 	pack(instance) {
 		// define how your custom class should be encoded
 		return Buffer.from([instance.myData]); // return a buffer
-	}
+	},
 	unpack(buffer) {
 		// define how your custom class should be decoded
 		let instance = new MyCustomClass();
@@ -246,7 +281,8 @@ addExtension({
 	}
 });
 ```
-If you want to use msgpackr to encode and decode the data within your extensions, you can use the `read` and `write` functions and read and write data/objects that will be encoded and decoded by msgpackr, which can be easier and faster than creating and receiving separate buffers (note that you can't just return the instance from `write` or msgpackr will recursively try to use extension infinitely):
+If you want to use msgpackr to encode and decode the data within your extensions, you can use the `read` and `write` functions and read and write data/objects that will be encoded and decoded by msgpackr, which can be easier and faster than creating and receiving separate buffers:
+
 ```js
 import { addExtension, Packr } from 'msgpackr';
 
@@ -269,6 +305,20 @@ addExtension({
 	}
 });
 ```
+Note that you can just return the same object from `write`, and in this case msgpackr will encode it using the default object/array encoding:
+```js
+addExtension({
+	Class: MyCustomClass,
+	type: 12,
+	read: function(data) {
+		Object.setPrototypeOf(data, MyCustomClass.prototype)
+		return data
+	},
+	write: function(data) {
+		return data
+	}
+})
+```
 You can also create an extension with `Class` and `write` methods, but no `type` (or `read`), if you just want to customize how a class is serialized without using MessagePack extension encoding.
 
 ### Additional Performance Optimizations
@@ -285,9 +335,9 @@ The record struction extension uses extension id 0x72 ("r") to declare the use o
 
 Once a record identifier and record field names have been defined, the parser/decoder should proceed to read the next value. Any subsequent use of the record identifier as a value in the block or stream should parsed as a record instance, and the next n values, where is n is the number of fields (as defined in the array of field names), should be read as the values of the fields. For example, here we have defined a structure with fields "foo" and "bar", with the record identifier 0x40, and then read a record instance that defines the field values of 4 and 2, respectively:
 ```
-+--------+--------+--------+~~~~~~~~~~~~~~~~~~~~~~~~~+--------+--------+--------+
-|  0xd4  |  0x72  |  0x40  | array: [ "foo", "bar" ] |  0x40  |  0x04  |  0x02  |
-+--------+--------+--------+~~~~~~~~~~~~~~~~~~~~~~~~~+--------+--------+--------+
++--------+--------+--------+~~~~~~~~~~~~~~~~~~~~~~~~~+--------+--------+
+|  0xd4  |  0x72  |  0x40  | array: [ "foo", "bar" ] |  0x04  |  0x02  |
++--------+--------+--------+~~~~~~~~~~~~~~~~~~~~~~~~~+--------+--------+
 ```
 Which should generate an object that would correspond to JSON:
 ```js
